@@ -13,24 +13,13 @@ GET  /file/{msg_id}     -> generic file (Range supported)
 
 Environment variables
 ---------------------
-TG_API_ID         37720402  Telegram API id
+TG_API_ID         (required)  Telegram API id
 TG_API_HASH       (required)  Telegram API hash
 TG_CHAT_ID        (required)  Numeric id (e.g. -1001234567890) or @username
-TG_SESSION_STRING (required)  Telethon StringSession (see "First run" below)
+TG_SESSION_STRING (required)  Telethon StringSession
 PORT              (optional)  Default 8080
 CHUNK_KB          (optional)  Chunk size in KB, default 512
 CACHE_TTL         (optional)  Seconds to cache message lookups, default 3600
-
-First run – generate a StringSession (do this ONCE locally):
-
-    python -c "from telethon.sync import TelegramClient; \
-        from telethon.sessions import StringSession; \
-        api_id=int(input('id: ')); api_hash=input('hash: '); \
-        print(TelegramClient(StringSession(), api_id, api_hash).start().session.save())"
-
-Paste the printed string as TG_SESSION_STRING on the host.
-(You can also reuse the local session.session by running this file once locally
-with TG_SESSION_STRING unset – it will print the StringSession to stdout.)
 
 Author: Gourav Rajput
 """
@@ -43,7 +32,7 @@ import os
 import time
 from typing import Optional, Dict, Tuple
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 
@@ -74,7 +63,6 @@ PORT      = int(os.environ.get("PORT", "8080"))
 CHUNK_KB  = int(os.environ.get("CHUNK_KB", "512"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 
-# Telegram requires offset to be a multiple of 4 KB and limit a power of 2 ≤ 1MB
 TG_BLOCK = 1024 * 1024            # 1 MB internal Telegram block
 HTTP_CHUNK = max(64, CHUNK_KB) * 1024
 
@@ -87,7 +75,7 @@ except ValueError:
     CHAT_REF = CHAT_ID  # @username
 
 # ---------------------------------------------------------------------------
-# Telethon client (single, shared)
+# Telethon client
 # ---------------------------------------------------------------------------
 
 client = TelegramClient(
@@ -98,8 +86,6 @@ client = TelegramClient(
     connection_retries=10, retry_delay=2, request_retries=5,
 )
 
-# Per-request locking to avoid hammering Telegram with many concurrent
-# downloads of the same chunk (helps a lot with seek-spam).
 _chat_entity = None
 _msg_cache: Dict[int, Tuple[float, object]] = {}
 _lock = asyncio.Lock()
@@ -130,9 +116,6 @@ async def get_message(msg_id: int):
 
 
 def media_info(msg) -> Tuple[object, int, str, str]:
-    """
-    Returns (input_location, size, mime, filename) for the message media.
-    """
     if isinstance(msg.media, MessageMediaDocument) and msg.media.document:
         doc: Document = msg.media.document
         loc = InputDocumentFileLocation(
@@ -147,7 +130,6 @@ def media_info(msg) -> Tuple[object, int, str, str]:
 
     if isinstance(msg.media, MessageMediaPhoto) and msg.media.photo:
         photo = msg.media.photo
-        # pick the largest size
         largest = max(
             (s for s in photo.sizes if hasattr(s, "size")),
             key=lambda s: getattr(s, "size", 0),
@@ -169,14 +151,12 @@ def media_info(msg) -> Tuple[object, int, str, str]:
 # ---------------------------------------------------------------------------
 
 def parse_range(header: str, size: int) -> Tuple[int, int]:
-    """Parse 'bytes=START-END' returning inclusive (start,end)."""
     try:
         units, rng = header.split("=", 1)
         if units.strip().lower() != "bytes":
             raise ValueError
         start_s, end_s = rng.split("-", 1)
         if start_s == "":
-            # suffix range  bytes=-N  -> last N bytes
             n = int(end_s)
             start = max(0, size - n); end = size - 1
         else:
@@ -192,32 +172,48 @@ def parse_range(header: str, size: int) -> Tuple[int, int]:
 async def iter_telegram(loc, size: int, start: int, end: int):
     """
     Yield bytes from `start` to `end` (inclusive) using Telegram's
-    iter_download.  We align to 1 MB Telegram blocks then trim.
+    iter_download.  Aligns to 1 MB Telegram blocks then trims.
+    Always yields real `bytes` objects (never memoryview / bytearray) so
+    Starlette's StreamingResponse won't try to .encode() them.
     """
     aligned_offset = (start // TG_BLOCK) * TG_BLOCK
     skip_head = start - aligned_offset
     bytes_needed = end - start + 1
 
     sent = 0
-    # iter_download streams in TG_BLOCK chunks starting from offset
-    async for chunk in client.iter_download(
-        loc, offset=aligned_offset, request_size=TG_BLOCK,
-        file_size=size, stride=TG_BLOCK,
-    ):
-        if not chunk:
-            break
-        if skip_head:
-            if skip_head >= len(chunk):
-                skip_head -= len(chunk)
+    try:
+        async for chunk in client.iter_download(
+            loc, offset=aligned_offset, request_size=TG_BLOCK,
+            file_size=size, stride=TG_BLOCK,
+        ):
+            if not chunk:
+                break
+
+            # Normalise to bytes (Telethon may return memoryview/bytearray)
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
                 continue
-            chunk = chunk[skip_head:]
-            skip_head = 0
-        if sent + len(chunk) >= bytes_needed:
-            yield chunk[: bytes_needed - sent]
-            sent = bytes_needed
-            break
-        yield chunk
-        sent += len(chunk)
+            chunk = bytes(chunk)
+
+            if skip_head:
+                if skip_head >= len(chunk):
+                    skip_head -= len(chunk)
+                    continue
+                chunk = chunk[skip_head:]
+                skip_head = 0
+
+            remaining = bytes_needed - sent
+            if len(chunk) >= remaining:
+                yield chunk[:remaining]
+                sent = bytes_needed
+                break
+            yield chunk
+            sent += len(chunk)
+    except (asyncio.CancelledError, GeneratorExit):
+        # Client disconnected (seek / pause / closed tab) – this is normal.
+        return
+    except Exception as e:
+        log.warning("iter_telegram error: %s", e)
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +294,6 @@ async def _serve(msg_id: int, request: Request, *, force_inline: Optional[str] =
             status_code=206, headers=headers, media_type=mime,
         )
 
-    # No Range -> still stream but in 1MB chunks (don't load to RAM)
     headers["Content-Length"] = str(size)
     return StreamingResponse(
         iter_telegram(loc, size, 0, size - 1),
@@ -323,13 +318,10 @@ async def file(msg_id: int, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint  (Railway / Render / PythonAnywhere all run "python app.py" or
-# use the Procfile.)
+# Entrypoint
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # If no SESSION env-var, print the current StringSession so the user can
-    # copy it to the host's environment.
     if not SESSION and API_ID and API_HASH:
         async def _print():
             await client.connect()

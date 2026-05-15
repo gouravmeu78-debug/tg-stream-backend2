@@ -1,8 +1,8 @@
 """
 app.py
 ======
-FastAPI backend that streams Telegram media with proper HTTP Range / 206
-Partial-Content responses (YouTube / Netflix-style seeking, low RAM).
+FastAPI backend that streams Telegram media with HTTP Range / 206
+Partial-Content responses. Optimised for fast Netflix/YouTube-like seeking.
 
 Endpoints
 ---------
@@ -10,6 +10,7 @@ GET  /                  -> health
 GET  /watch/{msg_id}    -> stream video / audio (Range supported)
 GET  /pdf/{msg_id}      -> inline PDF (Range supported)
 GET  /file/{msg_id}     -> generic file (Range supported)
+GET  /info/{msg_id}     -> metadata for a message
 
 Environment variables
 ---------------------
@@ -18,8 +19,8 @@ TG_API_HASH       (required)  Telegram API hash
 TG_CHAT_ID        (required)  Numeric id (e.g. -1001234567890) or @username
 TG_SESSION_STRING (required)  Telethon StringSession
 PORT              (optional)  Default 8080
-CHUNK_KB          (optional)  Chunk size in KB, default 512
-CACHE_TTL         (optional)  Seconds to cache message lookups, default 3600
+TG_REQUEST_KB     (optional)  Telegram block size in KB, default 1024 (max 1024)
+TG_PARALLEL       (optional)  Parallel TG download workers, default 4
 
 Author: Gourav Rajput
 """
@@ -55,16 +56,17 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("tg-stream")
 
-API_ID    = int(os.environ.get("TG_API_ID", "0"))
-API_HASH  = os.environ.get("TG_API_HASH", "")
-CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
-SESSION   = os.environ.get("TG_SESSION_STRING", "")
-PORT      = int(os.environ.get("PORT", "8080"))
-CHUNK_KB  = int(os.environ.get("CHUNK_KB", "512"))
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
+API_ID       = int(os.environ.get("TG_API_ID", "0"))
+API_HASH     = os.environ.get("TG_API_HASH", "")
+CHAT_ID      = os.environ.get("TG_CHAT_ID", "")
+SESSION      = os.environ.get("TG_SESSION_STRING", "")
+PORT         = int(os.environ.get("PORT", "8080"))
+TG_REQUEST_KB = int(os.environ.get("TG_REQUEST_KB", "1024"))   # 1 MB Telegram blocks (max)
+TG_PARALLEL   = int(os.environ.get("TG_PARALLEL", "4"))        # 4 parallel TG workers
+CACHE_TTL    = int(os.environ.get("CACHE_TTL", "3600"))
 
-TG_BLOCK = 1024 * 1024            # 1 MB internal Telegram block
-HTTP_CHUNK = max(64, CHUNK_KB) * 1024
+TG_BLOCK = max(64, min(TG_REQUEST_KB, 1024)) * 1024
+TG_PARALLEL = max(1, min(TG_PARALLEL, 16))
 
 if not API_ID or not API_HASH or not CHAT_ID:
     log.warning("Missing TG_API_ID / TG_API_HASH / TG_CHAT_ID – set them as env vars.")
@@ -72,7 +74,7 @@ if not API_ID or not API_HASH or not CHAT_ID:
 try:
     CHAT_REF: object = int(CHAT_ID)
 except ValueError:
-    CHAT_REF = CHAT_ID  # @username
+    CHAT_REF = CHAT_ID
 
 # ---------------------------------------------------------------------------
 # Telethon client
@@ -84,22 +86,24 @@ client = TelegramClient(
     device_model="TG-Stream Backend",
     system_version="1.0", app_version="1.0",
     connection_retries=10, retry_delay=2, request_retries=5,
+    flood_sleep_threshold=60,
 )
 
 _chat_entity = None
 _msg_cache: Dict[int, Tuple[float, object]] = {}
-_lock = asyncio.Lock()
+_start_lock = asyncio.Lock()
 
 
 async def ensure_started():
-    if not client.is_connected():
-        await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError("Telethon session not authorized. Set TG_SESSION_STRING.")
-    global _chat_entity
-    if _chat_entity is None:
-        _chat_entity = await client.get_entity(CHAT_REF)
-        log.info("Resolved chat: %s", getattr(_chat_entity, "title", _chat_entity))
+    async with _start_lock:
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telethon session not authorized. Set TG_SESSION_STRING.")
+        global _chat_entity
+        if _chat_entity is None:
+            _chat_entity = await client.get_entity(CHAT_REF)
+            log.info("Resolved chat: %s", getattr(_chat_entity, "title", _chat_entity))
 
 
 async def get_message(msg_id: int):
@@ -147,7 +151,7 @@ def media_info(msg) -> Tuple[object, int, str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Range-aware streaming
+# Range parsing
 # ---------------------------------------------------------------------------
 
 def parse_range(header: str, size: int) -> Tuple[int, int]:
@@ -169,58 +173,86 @@ def parse_range(header: str, size: int) -> Tuple[int, int]:
         raise HTTPException(416, "Invalid Range")
 
 
+# ---------------------------------------------------------------------------
+# FAST parallel streaming
+# ---------------------------------------------------------------------------
+
+async def _fetch_block(loc, offset: int, size: int) -> bytes:
+    """Fetch a single TG_BLOCK starting at `offset` (must be 4 KB-aligned)."""
+    buf = bytearray()
+    async for chunk in client.iter_download(
+        loc, offset=offset, request_size=TG_BLOCK,
+        file_size=size, stride=TG_BLOCK,
+    ):
+        if not chunk:
+            break
+        buf.extend(bytes(chunk))
+        if len(buf) >= TG_BLOCK:
+            break
+    return bytes(buf[:TG_BLOCK])
+
+
 async def iter_telegram(loc, size: int, start: int, end: int):
     """
-    Yield bytes from `start` to `end` (inclusive) using Telegram's
-    iter_download.  Aligns to 1 MB Telegram blocks then trims.
-    Always yields real `bytes` objects (never memoryview / bytearray) so
-    Starlette's StreamingResponse won't try to .encode() them.
+    Stream bytes [start..end] from Telegram, prefetching `TG_PARALLEL`
+    blocks ahead so the network pipe stays full.
+
+    Yields plain bytes (Starlette can't handle memoryview).
     """
-    aligned_offset = (start // TG_BLOCK) * TG_BLOCK
-    skip_head = start - aligned_offset
+    aligned_start = (start // TG_BLOCK) * TG_BLOCK
+    skip_head = start - aligned_start
     bytes_needed = end - start + 1
 
+    # All offsets we need (1 MB-aligned)
+    offsets = list(range(aligned_start, end + 1, TG_BLOCK))
+
     sent = 0
+    in_flight: "list[asyncio.Task[bytes]]" = []
     try:
-        async for chunk in client.iter_download(
-            loc, offset=aligned_offset, request_size=TG_BLOCK,
-            file_size=size, stride=TG_BLOCK,
-        ):
-            if not chunk:
-                break
+        # Prime the pipeline
+        i = 0
+        while i < len(offsets) and len(in_flight) < TG_PARALLEL:
+            in_flight.append(asyncio.create_task(_fetch_block(loc, offsets[i], size)))
+            i += 1
 
-            # Normalise to bytes (Telethon may return memoryview/bytearray)
-            if not isinstance(chunk, (bytes, bytearray, memoryview)):
-                continue
-            chunk = bytes(chunk)
+        first = True
+        while in_flight:
+            block = await in_flight.pop(0)
 
-            if skip_head:
-                if skip_head >= len(chunk):
-                    skip_head -= len(chunk)
-                    continue
-                chunk = chunk[skip_head:]
-                skip_head = 0
+            # Schedule the next prefetch immediately
+            if i < len(offsets):
+                in_flight.append(asyncio.create_task(_fetch_block(loc, offsets[i], size)))
+                i += 1
+
+            if first:
+                block = block[skip_head:]
+                first = False
 
             remaining = bytes_needed - sent
-            if len(chunk) >= remaining:
-                yield chunk[:remaining]
+            if not block:
+                continue
+            if len(block) >= remaining:
+                yield block[:remaining]
                 sent = bytes_needed
                 break
-            yield chunk
-            sent += len(chunk)
+            yield block
+            sent += len(block)
+
     except (asyncio.CancelledError, GeneratorExit):
-        # Client disconnected (seek / pause / closed tab) – this is normal.
-        return
+        pass
     except Exception as e:
         log.warning("iter_telegram error: %s", e)
-        return
+    finally:
+        # Cancel any remaining prefetches when client disconnects / done
+        for t in in_flight:
+            t.cancel()
 
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="TG-Stream", version="1.0.0",
+app = FastAPI(title="TG-Stream", version="1.1.0",
               description="Stream Telegram media with HTTP Range support.")
 
 app.add_middleware(
@@ -251,9 +283,12 @@ async def _shutdown():
 async def root():
     return JSONResponse({
         "service": "tg-stream backend",
+        "version": "1.1.0",
         "developer": "Gourav Rajput",
         "endpoints": ["/watch/{id}", "/pdf/{id}", "/file/{id}", "/info/{id}"],
         "chat": str(CHAT_REF),
+        "tg_block_kb": TG_BLOCK // 1024,
+        "tg_parallel": TG_PARALLEL,
     })
 
 
@@ -278,6 +313,8 @@ async def _serve(msg_id: int, request: Request, *, force_inline: Optional[str] =
         "Cache-Control": "public, max-age=3600",
         "Content-Disposition": f'{force_inline or "inline"}; filename="{fname}"',
         "Access-Control-Allow-Origin": "*",
+        # Disable proxy buffering (Railway/Render use nginx-like proxies)
+        "X-Accel-Buffering": "no",
     }
 
     if request.method == "HEAD":
@@ -289,12 +326,15 @@ async def _serve(msg_id: int, request: Request, *, force_inline: Optional[str] =
         length = end - start + 1
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         headers["Content-Length"] = str(length)
+        log.info("RANGE %s [%s-%s] (%.1f MB) of %s",
+                 msg_id, start, end, length / 1048576, fname)
         return StreamingResponse(
             iter_telegram(loc, size, start, end),
             status_code=206, headers=headers, media_type=mime,
         )
 
     headers["Content-Length"] = str(size)
+    log.info("FULL %s (%.1f MB) of %s", msg_id, size / 1048576, fname)
     return StreamingResponse(
         iter_telegram(loc, size, 0, size - 1),
         status_code=200, headers=headers, media_type=mime,

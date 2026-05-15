@@ -5,32 +5,8 @@ Multi-chat FastAPI backend that streams Telegram media with HTTP Range / 206
 Partial-Content responses. ONE deployment serves unlimited generated sites.
 
 URL pattern: /watch/{chat_id}/{msg_id}, /pdf/{chat_id}/{msg_id}, etc.
-
-Backwards-compatible legacy URLs (/watch/{msg_id}) still work if you set
-TG_CHAT_ID env var (uses that as the default chat).
-
-Endpoints
----------
-GET  /                            -> health
-GET  /watch/{chat}/{msg_id}       -> stream video / audio (Range supported)
-GET  /pdf/{chat}/{msg_id}         -> inline PDF
-GET  /file/{chat}/{msg_id}        -> generic file
-GET  /info/{chat}/{msg_id}        -> metadata
-GET  /watch/{msg_id}              -> legacy, uses TG_CHAT_ID
-GET  /pdf/{msg_id}                -> legacy
-GET  /file/{msg_id}               -> legacy
-GET  /info/{msg_id}               -> legacy
-
-Environment variables
----------------------
-TG_API_ID         (required)
-TG_API_HASH       (required)
-TG_SESSION_STRING (required)
-TG_CHAT_ID        (optional)  Default chat for legacy URLs
-PORT              (optional)  Default 8080
-TG_REQUEST_KB     (optional)  TG block size, default 1024 (max 1024)
-TG_PARALLEL       (optional)  Parallel TG workers, default 4
-ALLOWED_CHATS     (optional)  Comma-separated chat ids; if set, only these are served
+Chat IDs are auto-normalised – you can pass 3315036053, -1003315036053,
+-3315036053 or @username; backend figures out the right form.
 
 Author: Gourav Rajput
 """
@@ -41,7 +17,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional, Dict, Tuple, Union
+from typing import Optional, Dict, Tuple, Union, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,37 +71,92 @@ client = TelegramClient(
     flood_sleep_threshold=60,
 )
 
-_chat_cache: Dict[str, object] = {}            # chat_ref_str -> entity
-_msg_cache: Dict[Tuple[str, int], Tuple[float, object]] = {}
+_chat_cache: Dict[str, object] = {}            # any chat ref -> entity
+_msg_cache: Dict[Tuple[int, int], Tuple[float, object]] = {}
+_dialogs_loaded = False
 _start_lock = asyncio.Lock()
-_started = False
 
 
 def _norm_chat(chat: Union[str, int]) -> str:
-    """Normalise any chat reference to a comparable string."""
     return str(chat).strip()
 
 
-def _parse_chat_ref(chat: str):
+def _candidate_ids(chat: str) -> List[Union[int, str]]:
+    """
+    Telegram has 3 different ways to refer to the same group/channel:
+      - bare ID:                 3315036053
+      - signed channel ID:       -1003315036053   (most common in URLs)
+      - alternate negative ID:   -3315036053       (legacy basic-group form)
+    Plus @username for public ones.
+
+    We try them all and use whichever Telethon resolves first.
+    """
     chat = chat.strip()
-    if chat.lstrip("-").isdigit():
-        return int(chat)
-    return chat  # @username
+    if not chat:
+        return []
+    if chat.startswith("@") or not chat.lstrip("-").isdigit():
+        return [chat]
+
+    n = int(chat)
+    candidates: List[Union[int, str]] = []
+    if n < 0:
+        # already negative – try as-is plus the "fixed" -100 channel form
+        candidates.append(n)
+        s = str(abs(n))
+        if not s.startswith("100"):
+            candidates.append(int("-100" + s))
+        else:
+            # already -100xxx form, also try the bare positive
+            candidates.append(int(s[3:]))
+    else:
+        # positive – generate negative variants too
+        s = str(n)
+        candidates.append(int("-100" + s))   # most common
+        candidates.append(-n)                # legacy
+        candidates.append(n)                 # bare positive (rare)
+    # de-dup preserving order
+    seen = set(); out = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out
 
 
 def _check_allowed(chat: str):
-    if ALLOWED and _norm_chat(chat) not in ALLOWED:
+    if not ALLOWED:
+        return
+    # accept either the requested form OR its candidates being in the allow-list
+    cands = {str(c) for c in _candidate_ids(chat)} | {_norm_chat(chat)}
+    if not (cands & ALLOWED):
         raise HTTPException(403, f"Chat {chat} not in ALLOWED_CHATS")
 
 
 async def ensure_started():
-    global _started
     async with _start_lock:
         if not client.is_connected():
             await client.connect()
         if not await client.is_user_authorized():
             raise RuntimeError("Telethon session not authorized. Set TG_SESSION_STRING.")
-        _started = True
+
+
+async def _prime_dialogs():
+    """
+    Fetch all dialogs once so Telethon caches the entities in its session.
+    After this, get_entity(channel_id) works even if we never called the API
+    with that exact peer before.
+    """
+    global _dialogs_loaded
+    if _dialogs_loaded:
+        return
+    try:
+        await ensure_started()
+        log.info("Priming dialogs cache (one-time)…")
+        async for _ in client.iter_dialogs(limit=None):
+            pass
+        _dialogs_loaded = True
+        log.info("Dialogs cache primed.")
+    except Exception as e:
+        log.warning("Dialog priming failed: %s", e)
 
 
 async def get_entity(chat: str):
@@ -133,23 +164,50 @@ async def get_entity(chat: str):
     if key in _chat_cache:
         return _chat_cache[key]
     await ensure_started()
-    ent = await client.get_entity(_parse_chat_ref(key))
-    _chat_cache[key] = ent
-    log.info("Resolved chat %s -> %s", key, getattr(ent, "title", ent))
-    return ent
+
+    last_err: Optional[Exception] = None
+    for cand in _candidate_ids(key):
+        try:
+            ent = await client.get_entity(cand)
+            _chat_cache[key] = ent
+            log.info("Resolved chat %s (via %s) -> %s",
+                     key, cand, getattr(ent, "title", ent))
+            return ent
+        except (ValueError, Exception) as e:
+            last_err = e
+            continue
+
+    # Fallback: prime dialogs and try again
+    await _prime_dialogs()
+    for cand in _candidate_ids(key):
+        try:
+            ent = await client.get_entity(cand)
+            _chat_cache[key] = ent
+            log.info("Resolved chat %s (after dialog prime, via %s)",
+                     key, cand)
+            return ent
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise HTTPException(
+        404,
+        f"Could not resolve chat '{chat}'. Is your account a member of it? "
+        f"Try the full -100xxxxxxxxxx form. Last error: {last_err}",
+    )
 
 
 async def get_message(chat: str, msg_id: int):
-    key = (_norm_chat(chat), msg_id)
+    ent = await get_entity(chat)
+    cache_key = (ent.id, msg_id)
     now = time.time()
-    cached = _msg_cache.get(key)
+    cached = _msg_cache.get(cache_key)
     if cached and cached[0] > now:
         return cached[1]
-    ent = await get_entity(chat)
     msg = await client.get_messages(ent, ids=msg_id)
     if not msg or not msg.media:
         raise HTTPException(404, "Message not found or has no media")
-    _msg_cache[key] = (now + CACHE_TTL, msg)
+    _msg_cache[cache_key] = (now + CACHE_TTL, msg)
     return msg
 
 
@@ -270,8 +328,8 @@ async def iter_telegram(loc, size: int, start: int, end: int):
 # FastAPI
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="TG-Stream", version="2.0.0",
-              description="Multi-chat Telegram streaming backend.")
+app = FastAPI(title="TG-Stream", version="2.1.0",
+              description="Multi-chat Telegram streaming backend with chat-id auto-normalisation.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -287,6 +345,8 @@ async def _startup():
     if API_ID and API_HASH:
         try:
             await ensure_started()
+            # Pre-warm the dialog cache so the first /watch is fast
+            asyncio.create_task(_prime_dialogs())
         except Exception as e:
             log.warning("Startup auth deferred: %s", e)
 
@@ -301,17 +361,18 @@ async def _shutdown():
 async def root():
     return JSONResponse({
         "service": "tg-stream backend",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "developer": "Gourav Rajput",
         "endpoints": [
             "/watch/{chat}/{msg_id}", "/pdf/{chat}/{msg_id}",
             "/file/{chat}/{msg_id}", "/info/{chat}/{msg_id}",
-            "/watch/{msg_id} (legacy)",
+            "/watch/{msg_id} (legacy, uses TG_CHAT_ID)",
         ],
         "default_chat": DEFAULT_CHAT or None,
         "allowed_chats": sorted(ALLOWED) if ALLOWED else "all",
         "tg_block_kb": TG_BLOCK // 1024,
         "tg_parallel": TG_PARALLEL,
+        "dialogs_primed": _dialogs_loaded,
     })
 
 

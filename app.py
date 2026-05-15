@@ -1,26 +1,36 @@
 """
 app.py
 ======
-FastAPI backend that streams Telegram media with HTTP Range / 206
-Partial-Content responses. Optimised for fast Netflix/YouTube-like seeking.
+Multi-chat FastAPI backend that streams Telegram media with HTTP Range / 206
+Partial-Content responses. ONE deployment serves unlimited generated sites.
+
+URL pattern: /watch/{chat_id}/{msg_id}, /pdf/{chat_id}/{msg_id}, etc.
+
+Backwards-compatible legacy URLs (/watch/{msg_id}) still work if you set
+TG_CHAT_ID env var (uses that as the default chat).
 
 Endpoints
 ---------
-GET  /                  -> health
-GET  /watch/{msg_id}    -> stream video / audio (Range supported)
-GET  /pdf/{msg_id}      -> inline PDF (Range supported)
-GET  /file/{msg_id}     -> generic file (Range supported)
-GET  /info/{msg_id}     -> metadata for a message
+GET  /                            -> health
+GET  /watch/{chat}/{msg_id}       -> stream video / audio (Range supported)
+GET  /pdf/{chat}/{msg_id}         -> inline PDF
+GET  /file/{chat}/{msg_id}        -> generic file
+GET  /info/{chat}/{msg_id}        -> metadata
+GET  /watch/{msg_id}              -> legacy, uses TG_CHAT_ID
+GET  /pdf/{msg_id}                -> legacy
+GET  /file/{msg_id}               -> legacy
+GET  /info/{msg_id}               -> legacy
 
 Environment variables
 ---------------------
-TG_API_ID         (required)  Telegram API id
-TG_API_HASH       (required)  Telegram API hash
-TG_CHAT_ID        (required)  Numeric id (e.g. -1001234567890) or @username
-TG_SESSION_STRING (required)  Telethon StringSession
+TG_API_ID         (required)
+TG_API_HASH       (required)
+TG_SESSION_STRING (required)
+TG_CHAT_ID        (optional)  Default chat for legacy URLs
 PORT              (optional)  Default 8080
-TG_REQUEST_KB     (optional)  Telegram block size in KB, default 1024 (max 1024)
-TG_PARALLEL       (optional)  Parallel TG download workers, default 4
+TG_REQUEST_KB     (optional)  TG block size, default 1024 (max 1024)
+TG_PARALLEL       (optional)  Parallel TG workers, default 4
+ALLOWED_CHATS     (optional)  Comma-separated chat ids; if set, only these are served
 
 Author: Gourav Rajput
 """
@@ -31,7 +41,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,25 +66,21 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("tg-stream")
 
-API_ID       = int(os.environ.get("TG_API_ID", "0"))
-API_HASH     = os.environ.get("TG_API_HASH", "")
-CHAT_ID      = os.environ.get("TG_CHAT_ID", "")
-SESSION      = os.environ.get("TG_SESSION_STRING", "")
-PORT         = int(os.environ.get("PORT", "8080"))
-TG_REQUEST_KB = int(os.environ.get("TG_REQUEST_KB", "1024"))   # 1 MB Telegram blocks (max)
-TG_PARALLEL   = int(os.environ.get("TG_PARALLEL", "4"))        # 4 parallel TG workers
-CACHE_TTL    = int(os.environ.get("CACHE_TTL", "3600"))
+API_ID        = int(os.environ.get("TG_API_ID", "0"))
+API_HASH      = os.environ.get("TG_API_HASH", "")
+DEFAULT_CHAT  = os.environ.get("TG_CHAT_ID", "")
+SESSION       = os.environ.get("TG_SESSION_STRING", "")
+PORT          = int(os.environ.get("PORT", "8080"))
+TG_REQUEST_KB = int(os.environ.get("TG_REQUEST_KB", "1024"))
+TG_PARALLEL   = int(os.environ.get("TG_PARALLEL", "4"))
+CACHE_TTL     = int(os.environ.get("CACHE_TTL", "3600"))
+ALLOWED       = {x.strip() for x in os.environ.get("ALLOWED_CHATS", "").split(",") if x.strip()}
 
-TG_BLOCK = max(64, min(TG_REQUEST_KB, 1024)) * 1024
+TG_BLOCK    = max(64, min(TG_REQUEST_KB, 1024)) * 1024
 TG_PARALLEL = max(1, min(TG_PARALLEL, 16))
 
-if not API_ID or not API_HASH or not CHAT_ID:
-    log.warning("Missing TG_API_ID / TG_API_HASH / TG_CHAT_ID – set them as env vars.")
-
-try:
-    CHAT_REF: object = int(CHAT_ID)
-except ValueError:
-    CHAT_REF = CHAT_ID
+if not API_ID or not API_HASH:
+    log.warning("Missing TG_API_ID / TG_API_HASH – set them as env vars.")
 
 # ---------------------------------------------------------------------------
 # Telethon client
@@ -89,33 +95,61 @@ client = TelegramClient(
     flood_sleep_threshold=60,
 )
 
-_chat_entity = None
-_msg_cache: Dict[int, Tuple[float, object]] = {}
+_chat_cache: Dict[str, object] = {}            # chat_ref_str -> entity
+_msg_cache: Dict[Tuple[str, int], Tuple[float, object]] = {}
 _start_lock = asyncio.Lock()
+_started = False
+
+
+def _norm_chat(chat: Union[str, int]) -> str:
+    """Normalise any chat reference to a comparable string."""
+    return str(chat).strip()
+
+
+def _parse_chat_ref(chat: str):
+    chat = chat.strip()
+    if chat.lstrip("-").isdigit():
+        return int(chat)
+    return chat  # @username
+
+
+def _check_allowed(chat: str):
+    if ALLOWED and _norm_chat(chat) not in ALLOWED:
+        raise HTTPException(403, f"Chat {chat} not in ALLOWED_CHATS")
 
 
 async def ensure_started():
+    global _started
     async with _start_lock:
         if not client.is_connected():
             await client.connect()
         if not await client.is_user_authorized():
             raise RuntimeError("Telethon session not authorized. Set TG_SESSION_STRING.")
-        global _chat_entity
-        if _chat_entity is None:
-            _chat_entity = await client.get_entity(CHAT_REF)
-            log.info("Resolved chat: %s", getattr(_chat_entity, "title", _chat_entity))
+        _started = True
 
 
-async def get_message(msg_id: int):
+async def get_entity(chat: str):
+    key = _norm_chat(chat)
+    if key in _chat_cache:
+        return _chat_cache[key]
+    await ensure_started()
+    ent = await client.get_entity(_parse_chat_ref(key))
+    _chat_cache[key] = ent
+    log.info("Resolved chat %s -> %s", key, getattr(ent, "title", ent))
+    return ent
+
+
+async def get_message(chat: str, msg_id: int):
+    key = (_norm_chat(chat), msg_id)
     now = time.time()
-    cached = _msg_cache.get(msg_id)
+    cached = _msg_cache.get(key)
     if cached and cached[0] > now:
         return cached[1]
-    await ensure_started()
-    msg = await client.get_messages(_chat_entity, ids=msg_id)
+    ent = await get_entity(chat)
+    msg = await client.get_messages(ent, ids=msg_id)
     if not msg or not msg.media:
-        raise HTTPException(404, "Message not found or no media")
-    _msg_cache[msg_id] = (now + CACHE_TTL, msg)
+        raise HTTPException(404, "Message not found or has no media")
+    _msg_cache[key] = (now + CACHE_TTL, msg)
     return msg
 
 
@@ -174,11 +208,10 @@ def parse_range(header: str, size: int) -> Tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# FAST parallel streaming
+# Parallel streaming
 # ---------------------------------------------------------------------------
 
 async def _fetch_block(loc, offset: int, size: int) -> bytes:
-    """Fetch a single TG_BLOCK starting at `offset` (must be 4 KB-aligned)."""
     buf = bytearray()
     async for chunk in client.iter_download(
         loc, offset=offset, request_size=TG_BLOCK,
@@ -193,23 +226,14 @@ async def _fetch_block(loc, offset: int, size: int) -> bytes:
 
 
 async def iter_telegram(loc, size: int, start: int, end: int):
-    """
-    Stream bytes [start..end] from Telegram, prefetching `TG_PARALLEL`
-    blocks ahead so the network pipe stays full.
-
-    Yields plain bytes (Starlette can't handle memoryview).
-    """
     aligned_start = (start // TG_BLOCK) * TG_BLOCK
     skip_head = start - aligned_start
     bytes_needed = end - start + 1
-
-    # All offsets we need (1 MB-aligned)
     offsets = list(range(aligned_start, end + 1, TG_BLOCK))
 
     sent = 0
     in_flight: "list[asyncio.Task[bytes]]" = []
     try:
-        # Prime the pipeline
         i = 0
         while i < len(offsets) and len(in_flight) < TG_PARALLEL:
             in_flight.append(asyncio.create_task(_fetch_block(loc, offsets[i], size)))
@@ -218,42 +242,36 @@ async def iter_telegram(loc, size: int, start: int, end: int):
         first = True
         while in_flight:
             block = await in_flight.pop(0)
-
-            # Schedule the next prefetch immediately
             if i < len(offsets):
                 in_flight.append(asyncio.create_task(_fetch_block(loc, offsets[i], size)))
                 i += 1
-
             if first:
                 block = block[skip_head:]
                 first = False
-
-            remaining = bytes_needed - sent
             if not block:
                 continue
+            remaining = bytes_needed - sent
             if len(block) >= remaining:
                 yield block[:remaining]
                 sent = bytes_needed
                 break
             yield block
             sent += len(block)
-
     except (asyncio.CancelledError, GeneratorExit):
         pass
     except Exception as e:
         log.warning("iter_telegram error: %s", e)
     finally:
-        # Cancel any remaining prefetches when client disconnects / done
         for t in in_flight:
             t.cancel()
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# FastAPI
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="TG-Stream", version="1.1.0",
-              description="Stream Telegram media with HTTP Range support.")
+app = FastAPI(title="TG-Stream", version="2.0.0",
+              description="Multi-chat Telegram streaming backend.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -283,25 +301,26 @@ async def _shutdown():
 async def root():
     return JSONResponse({
         "service": "tg-stream backend",
-        "version": "1.1.0",
+        "version": "2.0.0",
         "developer": "Gourav Rajput",
-        "endpoints": ["/watch/{id}", "/pdf/{id}", "/file/{id}", "/info/{id}"],
-        "chat": str(CHAT_REF),
+        "endpoints": [
+            "/watch/{chat}/{msg_id}", "/pdf/{chat}/{msg_id}",
+            "/file/{chat}/{msg_id}", "/info/{chat}/{msg_id}",
+            "/watch/{msg_id} (legacy)",
+        ],
+        "default_chat": DEFAULT_CHAT or None,
+        "allowed_chats": sorted(ALLOWED) if ALLOWED else "all",
         "tg_block_kb": TG_BLOCK // 1024,
         "tg_parallel": TG_PARALLEL,
     })
 
 
-@app.get("/info/{msg_id}")
-async def info(msg_id: int):
-    msg = await get_message(msg_id)
-    loc, size, mime, fname = media_info(msg)
-    return {"id": msg_id, "filename": fname, "size": size, "mime": mime}
+# ---- Multi-chat handlers -------------------------------------------------
 
-
-async def _serve(msg_id: int, request: Request, *, force_inline: Optional[str] = None,
-                 force_mime: Optional[str] = None):
-    msg = await get_message(msg_id)
+async def _serve(chat: str, msg_id: int, request: Request, *,
+                 force_inline: Optional[str] = None, force_mime: Optional[str] = None):
+    _check_allowed(chat)
+    msg = await get_message(chat, msg_id)
     loc, size, mime, fname = media_info(msg)
     if force_mime:
         mime = force_mime
@@ -313,7 +332,6 @@ async def _serve(msg_id: int, request: Request, *, force_inline: Optional[str] =
         "Cache-Control": "public, max-age=3600",
         "Content-Disposition": f'{force_inline or "inline"}; filename="{fname}"',
         "Access-Control-Allow-Origin": "*",
-        # Disable proxy buffering (Railway/Render use nginx-like proxies)
         "X-Accel-Buffering": "no",
     }
 
@@ -326,39 +344,74 @@ async def _serve(msg_id: int, request: Request, *, force_inline: Optional[str] =
         length = end - start + 1
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         headers["Content-Length"] = str(length)
-        log.info("RANGE %s [%s-%s] (%.1f MB) of %s",
-                 msg_id, start, end, length / 1048576, fname)
+        log.info("RANGE chat=%s id=%s [%s-%s] (%.1f MB)",
+                 chat, msg_id, start, end, length / 1048576)
         return StreamingResponse(
             iter_telegram(loc, size, start, end),
             status_code=206, headers=headers, media_type=mime,
         )
 
     headers["Content-Length"] = str(size)
-    log.info("FULL %s (%.1f MB) of %s", msg_id, size / 1048576, fname)
+    log.info("FULL chat=%s id=%s (%.1f MB)", chat, msg_id, size / 1048576)
     return StreamingResponse(
         iter_telegram(loc, size, 0, size - 1),
         status_code=200, headers=headers, media_type=mime,
     )
 
 
-@app.api_route("/watch/{msg_id}", methods=["GET", "HEAD"])
-async def watch(msg_id: int, request: Request):
-    return await _serve(msg_id, request, force_inline="inline")
+@app.get("/info/{chat}/{msg_id}")
+async def info_multi(chat: str, msg_id: int):
+    _check_allowed(chat)
+    msg = await get_message(chat, msg_id)
+    loc, size, mime, fname = media_info(msg)
+    return {"chat": chat, "id": msg_id, "filename": fname, "size": size, "mime": mime}
 
 
-@app.api_route("/pdf/{msg_id}", methods=["GET", "HEAD"])
-async def pdf(msg_id: int, request: Request):
-    return await _serve(msg_id, request, force_inline="inline",
-                        force_mime="application/pdf")
+@app.api_route("/watch/{chat}/{msg_id}", methods=["GET", "HEAD"])
+async def watch_multi(chat: str, msg_id: int, request: Request):
+    return await _serve(chat, msg_id, request)
 
 
-@app.api_route("/file/{msg_id}", methods=["GET", "HEAD"])
-async def file(msg_id: int, request: Request):
-    return await _serve(msg_id, request, force_inline="inline")
+@app.api_route("/pdf/{chat}/{msg_id}", methods=["GET", "HEAD"])
+async def pdf_multi(chat: str, msg_id: int, request: Request):
+    return await _serve(chat, msg_id, request, force_mime="application/pdf")
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
+@app.api_route("/file/{chat}/{msg_id}", methods=["GET", "HEAD"])
+async def file_multi(chat: str, msg_id: int, request: Request):
+    return await _serve(chat, msg_id, request)
+
+
+# ---- Legacy single-chat handlers (use TG_CHAT_ID env) --------------------
+
+def _require_default_chat():
+    if not DEFAULT_CHAT:
+        raise HTTPException(400,
+            "Legacy single-id URL used but TG_CHAT_ID env-var is not set on backend. "
+            "Use /watch/{chat}/{id} instead.")
+    return DEFAULT_CHAT
+
+
+@app.get("/info/{msg_id:int}")
+async def info_legacy(msg_id: int):
+    return await info_multi(_require_default_chat(), msg_id)
+
+
+@app.api_route("/watch/{msg_id:int}", methods=["GET", "HEAD"])
+async def watch_legacy(msg_id: int, request: Request):
+    return await _serve(_require_default_chat(), msg_id, request)
+
+
+@app.api_route("/pdf/{msg_id:int}", methods=["GET", "HEAD"])
+async def pdf_legacy(msg_id: int, request: Request):
+    return await _serve(_require_default_chat(), msg_id, request, force_mime="application/pdf")
+
+
+@app.api_route("/file/{msg_id:int}", methods=["GET", "HEAD"])
+async def file_legacy(msg_id: int, request: Request):
+    return await _serve(_require_default_chat(), msg_id, request)
+
+
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

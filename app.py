@@ -132,29 +132,11 @@ def _check_allowed(chat: str):
 
 
 async def ensure_started():
-    """
-    Make sure Telethon is connected & authorized. Reconnects on disconnect.
-    Safe to call before EVERY request.
-    """
     async with _start_lock:
-        # Retry a few times in case of transient network issues
-        for attempt in range(3):
-            try:
-                if not client.is_connected():
-                    log.info("Telethon disconnected, reconnecting... (attempt %d)", attempt + 1)
-                    await client.connect()
-                if not await client.is_user_authorized():
-                    raise RuntimeError("Telethon session not authorized. Set TG_SESSION_STRING.")
-                return
-            except (ConnectionError, OSError) as e:
-                log.warning("Reconnect attempt %d failed: %s", attempt + 1, e)
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(1.5)
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telethon session not authorized. Set TG_SESSION_STRING.")
 
 
 async def _prime_dialogs():
@@ -288,49 +270,20 @@ def parse_range(header: str, size: int) -> Tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 async def _fetch_block(loc, offset: int, size: int) -> bytes:
-    """
-    Fetch a single TG_BLOCK starting at `offset`. On disconnect, reconnect
-    once and retry. Always returns bytes (possibly empty if fully failed).
-    """
-    for attempt in range(2):
-        try:
-            buf = bytearray()
-            async for chunk in client.iter_download(
-                loc, offset=offset, request_size=TG_BLOCK,
-                file_size=size, stride=TG_BLOCK,
-            ):
-                if not chunk:
-                    break
-                buf.extend(bytes(chunk))
-                if len(buf) >= TG_BLOCK:
-                    break
-            return bytes(buf[:TG_BLOCK])
-        except (ConnectionError, OSError, asyncio.CancelledError) as e:
-            if isinstance(e, asyncio.CancelledError):
-                raise
-            log.warning("Block fetch at offset=%d failed (attempt %d): %s", offset, attempt + 1, e)
-            if attempt == 0:
-                try:
-                    await ensure_started()
-                except Exception as ee:
-                    log.warning("Reconnect failed: %s", ee)
-                    return b""
-            else:
-                return b""
-        except Exception as e:
-            log.warning("Block fetch error at offset=%d: %s", offset, e)
-            return b""
-    return b""
+    buf = bytearray()
+    async for chunk in client.iter_download(
+        loc, offset=offset, request_size=TG_BLOCK,
+        file_size=size, stride=TG_BLOCK,
+    ):
+        if not chunk:
+            break
+        buf.extend(bytes(chunk))
+        if len(buf) >= TG_BLOCK:
+            break
+    return bytes(buf[:TG_BLOCK])
 
 
 async def iter_telegram(loc, size: int, start: int, end: int):
-    """
-    Stream bytes [start..end] from Telegram.
-
-    Guarantees yielding EXACTLY `end - start + 1` bytes — if Telegram
-    fails mid-stream we pad with zeros (the player will just skip) so
-    Content-Length matches and Starlette doesn't crash.
-    """
     aligned_start = (start // TG_BLOCK) * TG_BLOCK
     skip_head = start - aligned_start
     bytes_needed = end - start + 1
@@ -338,44 +291,23 @@ async def iter_telegram(loc, size: int, start: int, end: int):
 
     sent = 0
     in_flight: "list[asyncio.Task[bytes]]" = []
-    aborted = False
     try:
-        # Ensure connection is alive before starting
-        try:
-            await ensure_started()
-        except Exception as e:
-            log.warning("ensure_started failed in iter_telegram: %s", e)
-
         i = 0
         while i < len(offsets) and len(in_flight) < TG_PARALLEL:
             in_flight.append(asyncio.create_task(_fetch_block(loc, offsets[i], size)))
             i += 1
 
         first = True
-        while in_flight and sent < bytes_needed:
-            try:
-                block = await in_flight.pop(0)
-            except (asyncio.CancelledError, GeneratorExit):
-                aborted = True
-                raise
+        while in_flight:
+            block = await in_flight.pop(0)
             if i < len(offsets):
                 in_flight.append(asyncio.create_task(_fetch_block(loc, offsets[i], size)))
                 i += 1
-
             if first:
-                block = block[skip_head:] if block else b""
+                block = block[skip_head:]
                 first = False
-
             if not block:
-                # Telegram failed for this block — pad with zeros so client
-                # gets the expected content-length and no crash.
-                remaining = bytes_needed - sent
-                pad_len = min(TG_BLOCK, remaining)
-                log.warning("Padding %d empty bytes (offset failed)", pad_len)
-                yield b"\x00" * pad_len
-                sent += pad_len
                 continue
-
             remaining = bytes_needed - sent
             if len(block) >= remaining:
                 yield block[:remaining]
@@ -383,26 +315,10 @@ async def iter_telegram(loc, size: int, start: int, end: int):
                 break
             yield block
             sent += len(block)
-
-        # Final safety pad — if somehow we still didn't hit the full count
-        # (e.g. early break) make up the difference so Content-Length matches.
-        if sent < bytes_needed and not aborted:
-            pad_len = bytes_needed - sent
-            log.warning("Final pad %d bytes to match Content-Length", pad_len)
-            yield b"\x00" * pad_len
-            sent = bytes_needed
-
     except (asyncio.CancelledError, GeneratorExit):
-        # Client disconnected (seek / pause / close tab) — silent
         pass
     except Exception as e:
         log.warning("iter_telegram error: %s", e)
-        # Still pad whatever's left so Starlette doesn't blow up
-        if sent < bytes_needed:
-            try:
-                yield b"\x00" * (bytes_needed - sent)
-            except Exception:
-                pass
     finally:
         for t in in_flight:
             t.cancel()
@@ -424,24 +340,6 @@ app.add_middleware(
 )
 
 
-async def _keepalive():
-    """Ping Telegram every 60 seconds to keep the connection warm."""
-    while True:
-        try:
-            await asyncio.sleep(60)
-            if client.is_connected() and await client.is_user_authorized():
-                # cheap noop call
-                await client.get_me()
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            log.warning("Keepalive ping failed: %s — will reconnect on next request", e)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-
 @app.on_event("startup")
 async def _startup():
     if API_ID and API_HASH:
@@ -449,8 +347,6 @@ async def _startup():
             await ensure_started()
             # Pre-warm the dialog cache so the first /watch is fast
             asyncio.create_task(_prime_dialogs())
-            # Start keepalive task
-            asyncio.create_task(_keepalive())
         except Exception as e:
             log.warning("Startup auth deferred: %s", e)
 
